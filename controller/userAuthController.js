@@ -1,590 +1,396 @@
-const { OAuth2Client } = require("google-auth-library");
-const { createTokenforUser } = require("../services/authentication");
-const User = require("../models/userModel");
-const crypto = require("crypto");
-const { randomBytes, createHmac } = require("crypto");
-// const { randomBytes } = require("crypto");
-const { sendVerificationEmail, sendMagicLinkEmail } = require("../utils/emailUtils");
-const googleClient = new OAuth2Client(
-  "401067515093-9j7faengj216m6uc9csubrmo3men1m7p.apps.googleusercontent.com"
-);
-const { normalizePhone } = require("../utils/phoneUtils");
-require("dotenv").config();
-const { google } = require("googleapis");
-const querystring = require("querystring");
-const axios = require("axios");
-const ReferralLog = require("../models/referralLogModel");
-const { createYeastarExtensionForUser } = require("../utils/yeastarClient");
+const User = require("../models/user_model");
+const nodemailer = require("nodemailer");
+const mongoose = require("mongoose");
+const dotenv = require("dotenv");
+dotenv.config();
+const jwt = require("jsonwebtoken");
+const PlanPassing = require('../models/order_model'); // Path to your schema file
+const e = require("express");
 
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_LOGIN_URI // e.g. https://yourapi.com/auth/google/callback
-);
 
-const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:3000";
-
-// Requires: User and ReferralLog models in scope.
-// Put this near top of your controller file:
-async function addOrUpdateReferral(referrerId, referredUser) {
-  if (!referrerId || !referredUser || !referredUser._id) return null;
-
-  // Fetch fresh referrer doc
-  const referrer = await User.findById(referrerId);
-  if (!referrer) return null;
-
-  // Normalize phone objects from referredUser
-  const phoneObjs = Array.isArray(referredUser.phonenumbers)
-    ? referredUser.phonenumbers.map((p) => ({
-      countryCode: (p.countryCode || "").toString().replace(/^\+/, ""),
-      number: (p.number || "").toString().replace(/^\+/, ""),
-    }))
-    : [];
-
-  const referredIdStr = referredUser._id.toString();
-
-  // Find existing entry index (works if myReferrals contains objects or just ids)
-  const index = (referrer.myReferrals || []).findIndex((item) => {
-    if (!item) return false;
-    if (typeof item === "object" && item._id)
-      return item._id.toString() === referredIdStr;
-    // if stored as raw id string
-    try {
-      return item.toString() === referredIdStr;
-    } catch (e) {
-      return false;
-    }
-  });
-
-  let now = new Date();
-  let needSaveReferrer = false;
-  console.log("referrer index is", index);
-  if (index !== -1) {
-    // Update missing fields on existing entry
-    const entry = referrer.myReferrals[index];
-    if (!entry.firstname && referredUser.firstname) {
-      entry.firstname = referredUser.firstname;
-      needSaveReferrer = true;
-    }
-    if (!entry.lastname && referredUser.lastname) {
-      entry.lastname = referredUser.lastname;
-      needSaveReferrer = true;
-    }
-    if ((!entry.email || entry.email === "") && referredUser.email) {
-      entry.email = referredUser.email;
-      needSaveReferrer = true;
-    }
-
-    if (
-      (!Array.isArray(entry.phonenumbers) || entry.phonenumbers.length === 0) &&
-      phoneObjs.length
-    ) {
-      entry.phonenumbers = phoneObjs;
-      needSaveReferrer = true;
-    }
-    if (!entry.signupDate && referredUser.createdAt) {
-      entry.signupDate = referredUser.createdAt;
-      needSaveReferrer = true;
-    }
-
-    // markModified if subdoc changed
-    if (needSaveReferrer) referrer.markModified("myReferrals");
-  } else {
-    // Push new consistent object
-    const newEntry = {
-      _id: referredUser._id,
-      firstname: referredUser.firstname || "",
-      lastname: referredUser.lastname || "",
-      email: referredUser.email || "",
-      phonenumbers: phoneObjs,
-      signupDate: referredUser.createdAt || now,
-    };
-    console.log("new referral entry is", newEntry);
-    referrer.myReferrals = referrer.myReferrals || [];
-    referrer.myReferrals.push(newEntry);
-    needSaveReferrer = true;
-  }
-
-  // Save referrer if any changes were made to myReferrals
-  if (needSaveReferrer) {
-    await referrer.save();
-  }
-
-  // Credit logic is now handled in signupWithEmail to avoid race conditions
-
-  // Create ReferralLog if not exists (by email or phone)
+/**
+ * =====================================
+ * LOGIN CONTROLLER
+ * Email OR Phone + Password
+ * =====================================
+ */
+exports.loginUser = async (req, res) => {
   try {
-    const orQueries = [];
-    if (referredUser.email) orQueries.push({ email: referredUser.email });
-    if (phoneObjs.length) {
-      // use elemMatch to find same phone
-      orQueries.push({
-        phonenumbers: {
-          $elemMatch: {
-            countryCode: phoneObjs[0].countryCode,
-            number: phoneObjs[0].number,
-          },
-        },
-      });
-    }
-    if (orQueries.length) {
-      const existingLog = await ReferralLog.findOne({ $or: orQueries });
-      if (!existingLog) {
-        const log = {
-          referredBy: referrer._id,
-          referredUserId: referredUser._id,
-          signupDate: referredUser.createdAt || now,
-        };
-        if (referredUser.email) log.email = referredUser.email;
-        if (phoneObjs.length) log.phonenumbers = phoneObjs;
-        await ReferralLog.create(log);
-      }
-    }
-  } catch (err) {
-    console.error("ReferralLog create error:", err.message);
-  }
-
-  return true;
-}
-
-const signupWithEmail = async (req, res) => {
-  try {
-    const {
-      email = "",
-      password,
-      firstname = "",
-      lastname = "",
-      verifyToken = "",
-    } = req.body;
-
-    const referralCodeParam = req.body.referralCode || req.query.ref || "";
-
-    // === PART 1: Email Verification Flow ===
-    if (verifyToken) {
-      const user = await User.findOne({ emailVerificationToken: verifyToken });
-
-      if (!user) {
-        return res.status(400).json({
-          status: "error",
-          message: "Invalid or expired verification token",
-        });
-      }
-
-      user.isVerified = true;
-      user.emailVerificationToken = undefined;
-
-      if (!user.signupMethod) {
-        user.signupMethod = "email";
-      }
-
-      // === PART 3: Yeastar Extension Creation ===
-      try {
-        // Start extension creation after user is verified
-        const startExt = parseInt(process.env.EXTENSION_START || "1001", 10);
-        const maxAttempts = parseInt(
-          process.env.EXTENSION_MAX_ATTEMPTS || "500",
-          10
-        );
-
-        const nameForExtension =
-          `${user.firstname || ""} ${user.lastname || ""}`.trim() || user.email;
-
-        // Attempt to create Yeastar extension
-        const { extensionNumber, secret, result } =
-          await createYeastarExtensionForUser(user);
-
-        // If response not OK, throw manually
-        if (!extensionNumber || !result || result.errcode !== 0) {
-          throw new Error(
-            result?.errmsg || "Yeastar extension creation failed"
-          );
-        }
-
-        // ✅ Save extension details in user
-        user.extensionNumber = extensionNumber;
-        user.yeastarExtensionId = result?.data?.id || result?.id || null;
-        user.sipSecret = secret;
-        await user.save();
-
-        console.log("✅ Yeastar extension created:", extensionNumber);
-      } catch (err) {
-        console.error("❌ Yeastar extension creation failed:", err.message);
-
-        // Cleanup: delete the user since extension provisioning failed
-        await User.findByIdAndDelete(user._id);
-
-        return res.status(500).json({
-          status: "error",
-          message: `Signup failed: Yeastar extension could not be created (${err.message})`,
-        });
-      }
-
-      // Setup initial plan after email verification (skip for superadmin)
-      if (user.role !== "superadmin") {
-        if (user.referredBy) {
-          // Add $10 referral credits to the current user's cache
-          try {
-            console.log(
-              `Added $10 welcome credit to user cache for user ${user._id}`
-            );
-          } catch (error) {
-            console.error("Error adding welcome credit to user cache:", error);
-          }
-
-          // Add $10 referral credits to the referring user's cache if exists
-          try {
-            const referringUser = await User.findById(user.referredBy);
-            if (referringUser) {
-              console.log(
-                `Added $10 referral credit to referring user cache ${user.referredBy}`
-              );
-            }
-          } catch (error) {
-            console.error(
-              "Error adding referral credits to referring user:",
-              error
-            );
-          }
-        }
-      }
-
-      // Activate user after email verification
-      user.isActive = true;
-
-      // ✅ Optional: Update scannedMe for other users
-      await user.save();
-
-      const token = createTokenforUser(user);
-
-      return res.status(200).json({
-        status: "success",
-        message: "Email verified successfully. You can now log in.",
-        data: {
-          token,
-          registeredWith: user.signupMethod,
-        },
-      });
-    }
-
-    // === PART 2: Initial Signup (Before Verification) ===
-
-    // === BLOCK PUBLIC EMAIL PROVIDERS ===
-    const emailDomain = email.split("@")[1]?.toLowerCase();
-    if (!emailDomain) {
-      return res.status(400).json({
-        status: "error",
-        message: "Invalid email format",
-      });
-    }
-
-    if (disallowedEmailDomains.includes(emailDomain)) {
-      return res.status(400).json({
-        status: "error",
-        message: `Registration using ${emailDomain} is not allowed. Please use your company or custom domain email.`,
-      });
-    }
+    const { email,
+      // phonenumber, countryCode,
+      password } = req.body;
 
     if (!password || !email) {
       return res.status(400).json({
-        status: "error",
-        message: "Password and email are required",
+        success: false,
+        message: "Email and password are required",
       });
     }
 
-    const trimmedEmail = email.trim();
-
-    // Check if email already exists
-    const existingUser = await User.findOne({ email: trimmedEmail });
-    if (existingUser) {
-      return res.status(409).json({
-        status: "error",
-        message: "User with this email already exists",
-      });
-    }
-
-    // Generate Email Verification Token
-    const emailVerificationToken = crypto.randomBytes(32).toString("hex");
-
-    const referralCodeRaw = email + Date.now();
-    const referralCode = crypto
-      .createHash("sha256")
-      .update(referralCodeRaw)
-      .digest("hex")
-      .slice(0, 16);
-
-    let referredBy = null;
-    if (referralCodeParam) {
-      const referringUser = await User.findOne({
-        referralCode: referralCodeParam,
-      });
-
-      const previouslyReferred = await ReferralLog.findOne({
-        email: trimmedEmail,
-      });
-
-      if (previouslyReferred) {
-        return res.status(400).json({
-          status: "error",
-          message:
-            "This referral link has already been used with this email. Please sign up manually.",
-        });
-      }
-
-      referredBy = referringUser._id;
-      // }
-    }
-
-    // Create new user without plan (plan will be assigned after email verification)
-    const newUser = await User.create({
-      email: trimmedEmail,
+    const token = await User.matchPasswordAndGenerateToken({
+      email,
+      // phonenumber,
+      // countryCode,
       password,
-      firstname,
-      lastname,
-      isVerified: false,
-      signupMethod: "email",
-      role: "companyAdmin",
-      emailVerificationToken,
-      referralCode, // 🔥 store user’s unique referral code
-      isActive: true, // User is not active until email verification
-      referredBy,
     });
 
-    if (referredBy) {
-      const referrer = await User.findById(referredBy);
-      await ReferralLog.create({
-        email: newUser.email,
-        referredBy: referredBy,
-        referredUserId: newUser._id,
-      });
-      if (referrer) {
-        await addOrUpdateReferral(referredBy, newUser);
-      }
-    }
+    // Update user activity
+    const query = email
+      ? { email }
+      : {
+        phonenumbers: {
+          $elemMatch: { countryCode, number: phonenumber },
+        },
+      };
 
-    let referUrl = `${FRONTEND_URL}/register?ref=${newUser.referralCode}`;
-
-    let verificationLink = "";
-
-    if (referralCodeParam) {
-      verificationLink = `${FRONTEND_URL}/user-verification?verificationToken=${newUser.emailVerificationToken}&ref=${referralCodeParam}`;
-    } else {
-      verificationLink = `${FRONTEND_URL}/user-verification?verificationToken=${newUser.emailVerificationToken}`;
-    }
-
-    // Send verification email
-
-    await sendVerificationEmail(newUser.email, verificationLink);
-
-    console.log("Verification Link:", verificationLink);
-
-    // newUser.isActive = true; // mark as active
-
-    return res.status(201).json({
-      status: "success",
-      message:
-        "Signup started. Please verify your email to activate your account.",
-      data: {
-        _id: newUser._id,
-        email: newUser.email,
-        registeredWith: newUser.signupMethod,
-        referUrl,
-      },
+    await User.findOneAndUpdate(query, {
+      isActive: true,
+      lastSeen: new Date(),
     });
-  } catch (error) {
-    console.error("Signup error:", error);
-    return res.status(500).json({
-      status: "error",
-      message: "Signup failed",
-      error: error.message,
-    });
-  }
-};
-
-const resendVerificationLink = async (req, res) => {
-  try {
-    const { email = "" } = req.body;
-
-    if (!email || email.trim() === "") {
-      return res.status(400).json({
-        status: "error",
-        message: "Email is required",
-      });
-    }
-
-    const user = await User.findOne({ email: email.trim().toLowerCase() });
-
-    if (!user) {
-      return res.status(404).json({
-        status: "error",
-        message: "User with this email does not exist",
-      });
-    }
-
-    if (user.isVerified) {
-      return res.status(400).json({
-        status: "error",
-        message: "Email is already verified",
-      });
-    }
-
-    // Generate new token and save
-    user.emailVerificationToken = crypto.randomBytes(32).toString("hex");
-    await user.save();
-
-    // Build link and send email
-    const verificationLink = `${FRONTEND_URL}/user-verification?verificationToken=${user.emailVerificationToken}`;
-    await sendVerificationEmail(user.email, verificationLink);
 
     return res.status(200).json({
-      status: "success",
-      message: "Verification email resent successfully",
-      verificationLink,
+      success: true,
+      message: "Login successful",
+      token,
     });
   } catch (error) {
-    console.error("Resend verification error:", error);
-    return res.status(500).json({
-      status: "error",
-      message: "Failed to resend verification link",
-      error: error.message,
+    return res.status(401).json({
+      success: false,
+      message: error.message || "Login failed",
     });
   }
 };
 
-const unifiedLogin = async (req, res) => {
+// Create a new Plan Passing entry
+exports.createPlanPassing = async (req, res) => {
   try {
     const {
-      email = "",
-      password = "",
+      form_type,
+      category,
+      property,
+      client_details,
+      payment_details,
+      status
     } = req.body;
 
-    if (email && password) {
-      try {
-        const trimmedEmail = email?.trim()?.toLowerCase();
+    // 1. Logic to auto-calculate balance if not provided by frontend
+    const amount = payment_details?.amount || 0;
+    const advance = payment_details?.advance || 0;
+    const calculatedBalance = amount - advance;
+    // const isCreating = !contact_id || contact_id == "0";
+    const generatedId = new mongoose.Types.ObjectId();
 
-        // Build query conditions
-        const queryConditions = [];
-        if (trimmedEmail) queryConditions.push({ email: trimmedEmail });
+    // 2. Create a new document instance
+    const newPlan = new PlanPassing({
+      _id: generatedId,
+      order_id: generatedId,
+      form_type,
+      category,
+      property,
+      client_details,
+      payment_details: {
+        ...payment_details,
+        balance: payment_details?.balance ?? calculatedBalance
+      },
+      status: status || 'Draft'
+    });
 
-        if (queryConditions.length === 0) {
-          return res.status(400).json({
-            status: "error",
-            message: "Email is required",
-          });
+    // 3. Save to MongoDB
+    const savedPlan = await newPlan.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Plan Passing Form submitted successfully",
+      data: savedPlan
+    });
+
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: "Error creating plan entry",
+      error: error.message
+    });
+  }
+};
+
+// Get all Plan Passing entries
+exports.getAllPlans = async (req, res) => {
+  try {
+    // Fetches all documents and sorts them by newest first
+    const plans = await PlanPassing.find().sort({ createdAt: -1 });
+
+    res.status(200).json({
+      success: true,
+      count: plans.length,
+      data: plans
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Server Error: Could not retrieve plans",
+      error: error.message
+    });
+  }
+};
+
+// Get specific order details by Order ID
+exports.getPlanByOrderId = async (req, res) => {
+  try {
+    const { order_id } = req.body;
+
+    // Find the document in the property/client structure
+    const plan = await PlanPassing.findOne({ "order_id": order_id });
+
+    if (!plan) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found"
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: plan
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Error fetching order details",
+      error: error.message
+    });
+  }
+};
+
+// PUT/PATCH: Update Property and Client details only
+exports.updateGeneralDetails = async (req, res) => {
+  try {
+    const { order_id } = req.body;
+    const { form_type, category, property, client_details, status } = req.body;
+
+    const updatedOrder = await PlanPassing.findOneAndUpdate(
+      { order_id: order_id },
+      {
+        $set: {
+          form_type: form_type,
+          category: category,
+          property: property,
+          client_details: client_details,
+          status: status
         }
+      },
+      { new: true, runValidators: true }
+    );
 
-        const user = await User.findOne({ $or: queryConditions });
+    if (!updatedOrder) return res.status(404).json({ message: "Order not found" });
+
+    res.status(200).json({ success: true, data: updatedOrder });
+  } catch (error) {
+    res.status(400).json({ success: false, error: error.message });
+  }
+};
+
+// PUT/PATCH: Update Payment details only
+exports.updatePaymentDetails = async (req, res) => {
+  try {
+    const { order_id } = req.body;
+    const { amount, extra_payment } = req.body.payment_details;
+
+    // Auto-calculate the balance
+    const order = await PlanPassing.findOne({ order_id: order_id });
+    if (!order) return res.status(404).json({ message: "Order not found" });
+
+    const lastBalance = order.payment_details.balance || 0;
+    const lastAdvance = order.payment_details.advance || 0;
+
+    // const balance = amount - extra_payment;
+    const advance = lastAdvance + extra_payment;
+    if (amount) {
+      order.payment_details.amount = amount;
+      const newBalance = amount - advance;
+      order.payment_details.balance = newBalance;
+      order.payment_details.advance = advance;
+      await order.save();
+      return res.status(200).json({ success: true, data: order });
+    } else {
+      order.payment_details.advance = advance;
+      order.payment_details.balance = lastBalance - extra_payment;
+      await order.save();
+      return res.status(200).json({ success: true, data: order });
+    }
+
+  } catch (error) {
+    res.status(400).json({ success: false, error: error.message });
+  }
+};
+
+// Admin: Create a new user
+exports.adminCreateUser = async (req, res) => {
+  try {
+    const {
+      firstname,
+      lastname,
+      email,
+      password,
+      gender,
+      designation,
+      countryCode,
+      number
+    } = req.body;
+
+    // 1. Check if user already exists
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ success: false, message: "Email already exists" });
+    }
+
+    if (!firstname || !lastname || !email || !password) {
+      return res.status(400).json({ success: false, message: "Required fields are missing" });
+    }
+
+    // 2. Create new user instance 
+    // Note: The password will be hashed automatically by your userSchema.pre("save") hook
+    const newUser = new User({
+      firstname,
+      lastname,
+      email,
+      password,
+      gender,
+      designation,
+      role: "user",
+      isVerified: true, // Admin created users can be pre-verified
+      phonenumbers: [{ countryCode, number }]
+    });
+
+    await newUser.save();
+
+    // 3. Email Setup (Nodemailer)
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: process.env.EMAIL_USER, // Your Gmail
+        pass: process.env.EMAIL_PASS  // Your App Password
+      }
+    });
+
+    // 4. Proper HTML Email Format
+    const htmlTemplate = `
+        <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: auto; border: 1px solid #e0e0e0; border-radius: 10px; overflow: hidden;">
+            <div style="background-color: #4A90E2; padding: 20px; text-align: center; color: white;">
+                <h1>Welcome, ${firstname}!</h1>
+            </div>
+            <div style="padding: 30px; line-height: 1.6; color: #333;">
+                <p>Hello <strong>${firstname} ${lastname}</strong>,</p>
+                <p>An administrator has created an account for you in our system. You can now log in using the credentials below:</p>
+                
+                <div style="background-color: #f9f9f9; padding: 15px; border-radius: 5px; margin: 20px 0; border-left: 5px solid #4A90E2;">
+                    <p style="margin: 5px 0;"><strong>Login Email:</strong> ${email}</p>
+                    <p style="margin: 5px 0;"><strong>Temporary Password:</strong> <span style="color: #d9534f;">${password}</span></p>
+                </div>
+
+                <p>For your security, please change your password immediately after logging in.</p>
+                
+                <div style="text-align: center; margin-top: 30px;">
+                    <a href="#" style="background-color: #4A90E2; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; font-weight: bold;">Login to Your Account</a>
+                </div>
+            </div>
+            <div style="background-color: #f4f4f4; padding: 15px; text-align: center; font-size: 12px; color: #777;">
+                <p>This is an automated message. Please do not reply to this email.</p>
+            </div>
+        </div>
+        `;
+
+    const mailOptions = {
+      from: '"Admin Support" <' + process.env.EMAIL_USER + '>',
+      to: email,
+      subject: 'Your Account Credentials',
+      html: htmlTemplate
+    };
+
+    await transporter.sendMail(mailOptions);
+
+    res.status(201).json({
+      success: true,
+      message: "User created successfully and email sent!",
+      userId: newUser._id
+    });
+
+  } catch (error) {
+    console.error("User Creation Error:", error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// PUT: Admin adds funds to user's cache_credits
+exports.addFundsToUser = async (req, res) => {
+  try {
+    const { userId, amountToAdd } = req.body;
+
+    // 1. Validation
+    if (!amountToAdd || amountToAdd <= 0) {
+      return res.status(400).json({ message: "Please provide a valid amount greater than 0" });
+    }
+
+    // 2. Update the user using $inc (increment)
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      { $inc: { cache_credits: amountToAdd } },
+      { new: true, runValidators: true }
+    );
+
+    if (!updatedUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Successfully added ${amountToAdd} credits to ${updatedUser.firstname}'s account.`,
+      newBalance: updatedUser.cache_credits
+    });
+
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+// GET: Fetch all users
+exports.getAllUsers = async (req, res) => {
+    try {
+        // .select("-password -salt") ensures we don't send sensitive data to the frontend
+        const users = await User.find({ role: "user" }).select("-password -salt").sort({ createdAt: -1 });
+
+        res.status(200).json({
+            success: true,
+            count: users.length,
+            data: users
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// GET: Fetch a single user by ID
+exports.getUserById = async (req, res) => {
+    try {
+        const { id } = req.body;
+
+        const user = await User.findById(id).select("-password -salt");
 
         if (!user) {
-          return res
-            .status(401)
-            .json({ status: "error", message: "User not found" });
+            return res.status(404).json({
+                success: false,
+                message: "User not found"
+            });
         }
 
-        // If logging in by email, require email verification
-        if (trimmedEmail && !user.isVerified) {
-          return res.status(403).json({
-            status: "error",
-            message: "Please verify your email before logging in",
-          });
-        }
-
-        if (user.accountStatus === "deactivated") {
-          return res.status(403).json({
-            status: "error",
-            message: "Your account deactivated. Please contact support.",
-          });
-        }
-
-        if (user.accountStatus === "suspended") {
-          return res.status(403).json({
-            status: "error",
-            message: "Your account suspended. Please contact support.",
-          });
-        }
-
-        if (user.signupMethod === "email" && !trimmedEmail) {
-          return res.status(400).json({
-            status: "error",
-            message:
-              "This user signed up with email. Please login with email and password.",
-          });
-        }
-
-
-        // ✅ MANUAL PASSWORD CHECK
-        const hash = createHmac("sha256", user.salt)
-          .update(password)
-          .digest("hex");
-
-        if (hash !== user.password) {
-          return res.status(401).json({
-            status: "error",
-            message: "Invalid credentials",
-          });
-        }
-
-        // ✅ CREATE NEW SESSION (DESTROYS OLD LOGIN)
-        const newSessionId = randomBytes(32).toString("hex");
-
-        user.activeSessionId = newSessionId;
-        user.isActive = true;
-        user.lastSeen = new Date();
-        await user.save();
-        console.log(newSessionId);
-
-        // ✅ CREATE NEW TOKEN WITH SESSION ID
-        const token = createTokenforUser(user);
-
-        const now = new Date();
-        user.isActive = true; // mark as active
-        return res.json({
-          status: "success",
-          message: "Login successful",
-          data: {
-            token,
-            registeredWith: user.signupMethod,
-            role: user.role || "user",
-          },
+        res.status(200).json({
+            success: true,
+            data: user
         });
-      } catch (err) {
-        console.log("Login error:", err);
-        return res.status(401).json({
-          status: "error",
-          message: err.message || "Invalid credentials",
-        });
-      }
+    } catch (error) {
+        // Catch invalid MongoDB ObjectID format errors
+        if (error.kind === "ObjectId") {
+            return res.status(400).json({ success: false, message: "Invalid User ID format" });
+        }
+        res.status(500).json({ success: false, message: error.message });
     }
-    return res
-      .status(400)
-      .json({ status: "error", message: "Invalid login request" });
-  } catch (err) {
-    console.log(err);
-    return res.status(500).json({ status: "error", message: "Login failed" });
-  }
-};
-
-const logoutUser = async (req, res) => {
-  try {
-    console.log("hello");
-
-    const userId = req.user._id; // requires auth middleware
-    const user = await User.findById(userId);
-
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    user.isActive = false; // mark as inactive
-    user.lastSeen = new Date();
-    await user.save();
-
-    res.json({ message: "Logout successful" });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-};
-
-module.exports = {
-  signupWithEmail,
-  unifiedLogin,
-  resendVerificationLink,
-  logoutUser
 };

@@ -1,5 +1,5 @@
 const { validateToken } = require("../services/authentication");
-const User = require("../models/userModel");
+const User = require("../models/user_model");
 
 const checkForAuthentication = () => {
   return async (req, res, next) => {
